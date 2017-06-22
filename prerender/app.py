@@ -106,7 +106,7 @@ async def _render(prerender: Prerender, url: str, format: str = 'html') -> str:
 async def handle_request(request, exception):
     start_time = time.time()
     format = 'html'
-    url = request.path.replace('%3f', '?')
+    url = request.path.replace('%3f', '?').replace('%3F', '?')
     headers = dict()
     if url.startswith('/http'):
         url = url[1:]
