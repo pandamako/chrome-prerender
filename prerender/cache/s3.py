@@ -2,7 +2,7 @@ import os
 import io
 import codecs
 import asyncio
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 from typing import Optional
 
 import minio
@@ -59,9 +59,19 @@ class S3Cache(CacheBackend):
             metadata={'url': key, 'ttl': ttl}
         )
 
+    async def modified_since(self, key: str, format: str = 'html') -> Optional[float]:
+        path = self._filename(key, format)
+        loop = asyncio.get_event_loop()
+        try:
+            res = await loop.run_in_executor(None, self.client.stat_object, S3_BUCKET, path)
+        except (minio.error.NoSuchKey, asyncio.CancelledError):
+            return
+        return res.last_modified
+
+
     def _filename(self, url, format):
-        hex_name = codecs.encode(url.encode('utf-8'), 'hex').decode('utf-8')
-        sub_dir = os.path.join(hex_name[:2], hex_name[2:4])
-        name = hex_name[4:] + '.{}'.format(format)
         parsed_url = urlparse(url)
-        return os.path.join(parsed_url.hostname, sub_dir, name)
+        encoded_name = quote_plus(parsed_url.path)
+        if parsed_url.query:
+            encoded_name += '?{}'.format(quote_plus(parsed_url.query))
+        return os.path.join(parsed_url.hostname, encoded_name)

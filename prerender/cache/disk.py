@@ -1,7 +1,9 @@
 import os
 import lzma
 import asyncio
+import functools
 from typing import Optional
+from aiofiles.os import stat
 
 import diskcache
 
@@ -26,3 +28,14 @@ class DiskCache(CacheBackend):
     def set(self, key: str, payload: bytes, ttl: int = None, format: str = 'html') -> None:
         compressed = lzma.compress(payload)
         self._cache.set(key + format, compressed, expire=ttl)
+
+    async def modified_since(self, key: str, format: str = 'html') -> Optional[float]:
+        loop = asyncio.get_event_loop()
+        cache_read = functools.partial(self._cache.get, read=True)
+        file = await loop.run_in_executor(None, cache_read, key + format)
+        if not file:
+            return
+        filename = file.name
+        file.close()
+        stats = await stat(filename)
+        return stats.st_mtime

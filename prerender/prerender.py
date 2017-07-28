@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from multiprocessing import cpu_count
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from websockets.exceptions import InvalidHandshake, ConnectionClosed
 
@@ -12,10 +12,11 @@ from .exceptions import TemporaryBrowserFailure
 logger = logging.getLogger(__name__)
 
 PRERENDER_TIMEOUT: int = int(os.environ.get('PRERENDER_TIMEOUT', 30))
-CONCURRENCY_PER_WORKER: int = int(os.environ.get('CONCURRENCY', cpu_count() * 2))
+CONCURRENCY: int = int(os.environ.get('CONCURRENCY', cpu_count() * 2))
 MAX_ITERATIONS: int = int(os.environ.get('ITERATIONS', 200))
 CHROME_HOST: str = os.environ.get('CHROME_HOST', 'localhost')
 CHROME_PORT: int = int(os.environ.get('CHROME_PORT', 9222))
+USER_AGENT: Optional[str] = os.environ.get('USER_AGENT')
 
 
 class Prerender:
@@ -28,7 +29,17 @@ class Prerender:
         self._idle_pages: asyncio.Queue = asyncio.Queue(loop=self.loop)
 
     async def bootstrap(self) -> None:
-        for i in range(CONCURRENCY_PER_WORKER):
+        if USER_AGENT:
+            user_agent = USER_AGENT
+        else:
+            try:
+                version = await self._rdp.version()
+                user_agent = 'Prerender {}'.format(version['User-Agent'])
+            except Exception:
+                user_agent = None
+        self._rdp.user_agent = user_agent
+
+        for i in range(CONCURRENCY):
             page = await self._rdp.new_page()
             await self._idle_pages.put(page)
             self._pages.add(page)
@@ -74,6 +85,7 @@ class Prerender:
         except RuntimeError as e:
             # https://github.com/MagicStack/uvloop/issues/68
             if 'unable to perform operation' in str(e):
+                logger.error('RuntimeError: %s', str(e))
                 reopen = True
                 raise TemporaryBrowserFailure(str(e))
             else:

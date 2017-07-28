@@ -15,16 +15,18 @@ from multidict import CIMultiDict
 
 from .mhtml import MHTML
 from .exceptions import TemporaryBrowserFailure, TooManyResponseError
+from .constants import BLOCKED_URLS
 
 
 logger = logging.getLogger(__name__)
 
 
 class ChromeRemoteDebugger:
-    def __init__(self, host: str, port: int, loop=None) -> None:
+    def __init__(self, host: str, port: int, loop=None, user_agent: Optional[str] = None) -> None:
         self._debugger_url = 'http://{}:{}'.format(host, port)
         self._session = aiohttp.ClientSession(loop=loop)
         self.loop = loop
+        self.user_agent = user_agent
 
     async def pages(self) -> List[Dict]:
         async with self._session.get('{}/json/list'.format(self._debugger_url)) as res:
@@ -64,6 +66,7 @@ class ChromeRemoteDebugger:
 class Page:
     def __init__(self, debugger: ChromeRemoteDebugger, page_info: Dict, *, loop=None) -> None:
         self._debugger = debugger
+        self.user_agent: Optional[str] = debugger.user_agent
         self.loop = loop
         self.id: str = page_info['id']
         self.websocket_debugger_url: str = page_info['webSocketDebuggerUrl']
@@ -107,6 +110,7 @@ class Page:
         self.on('Network.requestWillBeSent', self._on_request_will_be_sent)
         self.on('Network.responseReceived', self._on_response_received)
         self.on('Network.loadingFailed', self._on_response_received)
+
         self.on('Network.dataReceived', self._update_last_active_time)
         self.on('Network.resourceChangedPriority', self._update_last_active_time)
         self.on('Network.webSocketWillSendHandshakeRequest', self._update_last_active_time)
@@ -129,6 +133,9 @@ class Page:
 
         self._ws_task = asyncio.ensure_future(self._listen())
         await asyncio.wait_for(self._enable_events(), timeout=5)
+        if self.user_agent is not None:
+            await self.set_user_agent(self.user_agent)
+        await self.set_blocked_urls(BLOCKED_URLS)
 
     async def detach(self) -> None:
         self._ws_task.cancel()
@@ -199,6 +206,12 @@ class Page:
             'params': {'userAgent': ua}
         })
 
+    async def set_blocked_urls(self, urls) -> Future:
+        return await self.send({
+            'method': 'Network.setBlockedURLs',
+            'params': {'urls': urls}
+        })
+
     async def navigate(self, url: str) -> Dict:
         if url != 'about:blank':
             self.iteration += 1
@@ -234,8 +247,10 @@ class Page:
                     break
             await asyncio.sleep(0.5)
 
-        succeed_res = sum([1 if is_response_ok(resp.get('response')) else 0
-                           for resp in self._responses_received.values()])
+        succeed_res = sum([
+            1 if is_response_ok(resp.get('response')) or resp.get('blockedReason') == 'inspector' else 0
+                for resp in self._responses_received.values()
+        ])
         success_rate = succeed_res / len(self._responses_received)
         if success_rate < 0.8:
             raise TooManyResponseError

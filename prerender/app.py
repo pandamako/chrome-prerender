@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
 from typing import Set
+from email.utils import parsedate, formatdate
 
 import raven
 from sanic import Sanic
@@ -16,16 +17,19 @@ from sanic import response
 from sanic.exceptions import NotFound
 from raven_aiohttp import AioHttpTransport
 
-from .prerender import Prerender, CONCURRENCY_PER_WORKER
+from .prerender import Prerender, CONCURRENCY
 from .cache import cache
 from .exceptions import TemporaryBrowserFailure, TooManyResponseError
+from .utils import apply_filters, remove_script_tags, remove_meta_fragment_tag
 
 
 logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=cpu_count() * 5)
 
+HTML_FILTERS = [remove_script_tags, remove_meta_fragment_tag]
+
 ALLOWED_DOMAINS: Set = set(dm.strip() for dm in
-                           os.environ.get('PRERENDER_ALLOWED_DOMAINS', '').split(',') if dm.strip())
+                           os.environ.get('ALLOWED_DOMAINS', '').split(',') if dm.strip())
 CACHE_LIVE_TIME: int = int(os.environ.get('CACHE_LIVE_TIME', 3600))
 SENTRY_DSN = os.environ.get('SENTRY_DSN')
 
@@ -71,17 +75,17 @@ async def show_brower_version(request):
 
 @app.route('/browser/disable', methods=['PUT'])
 async def disable_browser_rendering(request):
-    global CONCURRENCY_PER_WORKER
+    global CONCURRENCY
 
-    CONCURRENCY_PER_WORKER = 0
+    CONCURRENCY = 0
     return response.json({'message': 'success'})
 
 
 @app.route('/browser/enable', methods=['PUT'])
 async def enable_browser_rendering(request):
-    global CONCURRENCY_PER_WORKER
+    global CONCURRENCY
 
-    CONCURRENCY_PER_WORKER = int(os.environ['CONCURRENCY'])
+    CONCURRENCY = int(os.environ.get('CONCURRENCY', cpu_count() * 2))
     return response.json({'message': 'success'})
 
 
@@ -103,6 +107,7 @@ async def handle_request(request, exception):
     start_time = time.time()
     format = 'html'
     url = request.path
+    headers = dict()
     if url.startswith('/http'):
         url = url[1:]
     elif url.startswith('/html/http'):
@@ -134,19 +139,38 @@ async def handle_request(request, exception):
     if not skip_cache:
         try:
             data = await cache.get(url, format)
+            modified_since = await cache.modified_since(url) or time.time()
+            headers['Last-Modified'] = formatdate(modified_since, usegmt=True)
+
+            try:
+                if_modified_since = parsedate(request.headers.get('If-Modified-Since'))
+                if_modified_since = time.mktime(if_modified_since)
+            except TypeError:
+                if_modified_since = 0
+
+            if modified_since and if_modified_since >= modified_since:
+                logger.info('Got 304 for %s in cache in %dms',
+                            url,
+                            int((time.time() - start_time) * 1000))
+                return response.text('', status=304, headers=headers)
+
             if data is not None:
+                headers['X-Prerender-Cache'] = 'hit'
                 logger.info('Got 200 for %s in cache in %dms',
                             url,
                             int((time.time() - start_time) * 1000))
                 if format == 'html':
-                    return response.html(data.decode('utf-8'), headers={'X-Prerender-Cache': 'hit'})
-                return response.raw(data, headers={'X-Prerender-Cache': 'hit'})
+                    return response.html(
+                        apply_filters(data.decode('utf-8'), HTML_FILTERS),
+                        headers=headers
+                    )
+                return response.raw(data, headers=headers)
         except Exception:
             logger.exception('Error reading cache')
             if sentry:
                 sentry.captureException()
 
-    if CONCURRENCY_PER_WORKER <= 0:
+    if CONCURRENCY <= 0:
         # Read from cache only
         logger.warning('Got 502 for %s in %dms, prerender unavailable',
                        url,
@@ -155,6 +179,7 @@ async def handle_request(request, exception):
 
     try:
         data, status_code = await _render(request.app.prerender, url, format)
+        headers.update({'X-Prerender-Cache': 'miss', 'Last-Modified': formatdate(usegmt=True)})
         logger.info('Got %d for %s in %dms',
                     status_code,
                     url,
@@ -162,10 +187,14 @@ async def handle_request(request, exception):
         if format == 'html':
             if 200 <= status_code < 300:
                 executor.submit(_save_to_cache, url, data.encode('utf-8'), format)
-            return response.html(data, headers={'X-Prerender-Cache': 'miss'}, status=status_code)
+            return response.html(
+                apply_filters(data, HTML_FILTERS),
+                headers=headers,
+                status=status_code
+            )
         if 200 <= status_code < 300:
             executor.submit(_save_to_cache, url, data, format)
-        return response.raw(data, headers={'X-Prerender-Cache': 'miss'}, status=status_code)
+        return response.raw(data, headers=headers, status=status_code)
     except (asyncio.TimeoutError, asyncio.CancelledError, TemporaryBrowserFailure):
         logger.warning('Got 504 for %s in %dms',
                        url,
@@ -215,7 +244,7 @@ async def before_server_start(app: Sanic, loop):
         warnings.simplefilter('always', ResourceWarning)
 
     app.prerender = Prerender(loop=loop)
-    if CONCURRENCY_PER_WORKER > 0:
+    if CONCURRENCY > 0:
         try:
             await app.prerender.bootstrap()
         except Exception:
