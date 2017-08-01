@@ -16,6 +16,7 @@ from sanic import Sanic
 from sanic import response
 from sanic.exceptions import NotFound
 from raven_aiohttp import AioHttpTransport
+from honeybadger import honeybadger
 
 from .prerender import Prerender, CONCURRENCY
 from .cache import cache
@@ -32,6 +33,7 @@ ALLOWED_DOMAINS: Set = set(dm.strip() for dm in
                            os.environ.get('ALLOWED_DOMAINS', '').split(',') if dm.strip())
 CACHE_LIVE_TIME: int = int(os.environ.get('CACHE_LIVE_TIME', 3600))
 SENTRY_DSN = os.environ.get('SENTRY_DSN')
+HONEYBADGER_KEY = os.environ.get('HONEYBADGER_KEY')
 
 if SENTRY_DSN:
     sentry = raven.Client(
@@ -43,6 +45,8 @@ if SENTRY_DSN:
 else:
     sentry = None
 
+if HONEYBADGER_KEY:
+   honeybadger.configure(api_key=HONEYBADGER_KEY)
 
 def _save_to_cache(key: str, data: bytes, format: str = 'html') -> None:
     try:
